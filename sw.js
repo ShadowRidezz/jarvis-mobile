@@ -1,7 +1,7 @@
 // Offline shell: JARVIS opens with no signal. Network first (so updates arrive on the next open), cache as the
 // fallback. The brain's weights are cached separately by WebLLM itself.
-const CACHE = "jarvis-mobile-v1.1.0";
-const SHELL = ["./", "index.html", "style.css", "app.js", "merge.js", "brain-worker.js", "sphere.js", "vendor/web-llm.js",
+const CACHE = "jarvis-mobile-v1.2.0";
+const SHELL = ["./", "index.html", "style.css", "app.js", "merge.js", "brain-worker.js", "voice-worker.js", "sphere.js", "vendor/web-llm.js",
   "manifest.json", "icon-192.png", "icon-512.png"];
 
 self.addEventListener("install", (e) => {

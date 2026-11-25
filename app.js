@@ -4,7 +4,7 @@
 import { CreateWebWorkerMLCEngine, CreateMLCEngine, hasModelInCache, deleteModelAllInfoInCache } from "./vendor/web-llm.js";
 import { mergeFacts, sameFacts, newUid } from "./merge.js";
 
-const VERSION = "1.1.0";
+const VERSION = "1.2.0";
 const $ = (s) => document.querySelector(s);
 const store = {
   get(k, d) { try { const v = localStorage.getItem("jm." + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
@@ -125,7 +125,7 @@ function offerDownload() {
   const m = modelInfo(cfg.model);
   card("offer", {
     title: "BRAIN NOT ON THIS PHONE YET",
-    text: "JARVIS thinks on this phone, so his brain is downloaded once (about " + m.gb + " GB, Wi-Fi recommended). After that he works offline, with nothing sent anywhere.",
+    text: "JARVIS thinks on this phone, so his brain is downloaded once (about " + m.gb + " GB, plus his voice, 63 MB; Wi-Fi recommended). After that he works offline, with nothing sent anywhere.",
     meta: m.name,
     button: "DOWNLOAD BRAIN",
     onClick: () => loadBrain().catch(() => {}),
@@ -164,6 +164,7 @@ async function loadBrain() {
       }
       brain.model = m.id;
       card("none");
+      if (wantsJarvisVoice() && !piper.cached) piperStart();     // his voice (63 MB) follows the brain
       return brain.engine;
     } catch (e) {
       brain.engine = null; brain.model = null;
@@ -243,29 +244,149 @@ async function think(text) {
     speaker.end();
     const reply = clean(out);
     if (reply) logTurn({ role: "user", content: text }, { role: "assistant", content: reply });
-    if (!speechSynthesis.speaking) setState("idle");
+    idleIfDone();
   }
 }
 function logTurn(...msgs) { history.push(...msgs); history = history.slice(-30); store.set("chat", history); }
 
 async function stopEverything() {
+  voiceGen++; voiceChain = Promise.resolve();            // drop queued sentences
+  if (curSrc) { try { curSrc.stop(); } catch (_) {} }
   if (window.speechSynthesis) speechSynthesis.cancel();
   if (brain.busy && brain.engine) { try { await brain.engine.interruptGenerate(); } catch (_) {} }
 }
 
 /* ------------------------------------------------------------------ voice out */
+// JARVIS's own voice: Piper "Alan", the same voice file as the PC (identical SHA-256), synthesised on the phone in
+// voice-worker.js and played through the PC's chain (a touch of air above 6.5 kHz, a compressor, silence trimmed).
+// Speed = the PC's speech-rate setting (synced in the memory repo; 1.3 until the first sync). The phone's built-in
+// voices remain as a choice in Settings and as the stand-in while Alan is still downloading.
+const VOICE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main/en/en_GB/alan/medium/en_GB-alan-medium.onnx";
+const piper = { worker: null, ready: false, cached: false, failed: "", pct: 0, seq: 0, waiting: new Map() };
+const wantsJarvisVoice = () => !cfg.voice || cfg.voice === "jarvis";
+const speechRate = () => Math.min(1.6, Math.max(0.7, +(profile && profile.speechRate) || 1.3));
+caches.open("jarvis-voice-v1").then((c) => c.match(VOICE_URL)).then((hit) => { piper.cached = !!hit; if (hit && wantsJarvisVoice()) piperStart(); }).catch(() => {});
+
+function piperStart() {
+  if (piper.worker) return;
+  piper.failed = "";
+  piper.worker = new Worker(new URL("./voice-worker.js", import.meta.url));
+  piper.worker.onmessage = ({ data }) => {
+    if (data.type === "progress") { piper.pct = data.total ? Math.round(data.got / data.total * 100) : 0; renderVoiceHint(); return; }
+    if (data.type === "ready") { piper.ready = piper.cached = true; renderVoiceHint(); return; }
+    const w = piper.waiting.get(data.id);
+    if (!w) {                                               // the download / load itself failed
+      if (data.type === "error") { piper.failed = data.message; piper.worker.terminate(); piper.worker = null; renderVoiceHint(); }
+      return;
+    }
+    piper.waiting.delete(data.id);
+    data.type === "error" ? w.reject(new Error(data.message)) : w.resolve(data);
+  };
+  piper.worker.postMessage({ type: "load" });
+  renderVoiceHint();
+}
+function piperSynth(text) {
+  piperStart();
+  const id = ++piper.seq;
+  return new Promise((resolve, reject) => {
+    piper.waiting.set(id, { resolve, reject });
+    piper.worker.postMessage({ type: "speak", id, text, rate: speechRate() });
+  });
+}
+
+let actx = null, curSrc = null, voiceChain = Promise.resolve(), voiceGen = 0, voicePending = 0;
+function audio() {
+  if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+  if (actx.state === "suspended") actx.resume().catch(() => {});
+  return actx;
+}
+// Piper pads each sentence with silence: keep ~40 ms of breath each side, exactly as the PC does
+function voicedSpan(d, sr) {
+  const thr = 0.006, n = d.length;
+  let a = 0, b = n - 1;
+  while (a < n && Math.abs(d[a]) < thr) a++;
+  while (b > a && Math.abs(d[b]) < thr) b--;
+  if (b - a < sr * 0.05) return { start: 0, dur: n / sr };
+  const start = Math.max(0, a / sr - 0.04), end = Math.min(n / sr, b / sr + 0.05);
+  return { start, dur: end - start };
+}
+function playPcm(pcm, sr) {
+  return new Promise((resolve) => {
+    const ctx = audio();
+    const buf = ctx.createBuffer(1, pcm.length, sr);
+    buf.copyToChannel(pcm, 0);
+    const src = ctx.createBufferSource(); src.buffer = buf;
+    const eq = ctx.createBiquadFilter(); eq.type = "highshelf"; eq.frequency.value = 6500; eq.gain.value = 2.5;
+    const comp = ctx.createDynamicsCompressor(); comp.threshold.value = -22; comp.ratio.value = 6; comp.attack.value = 0.004;
+    const an = ctx.createAnalyser(); an.fftSize = 256;
+    const gain = ctx.createGain(); gain.gain.value = 1.05;
+    src.connect(eq); eq.connect(comp); comp.connect(an); an.connect(gain); gain.connect(ctx.destination);
+    curSrc = src;
+    setState("speaking");
+    const td = new Uint8Array(an.fftSize);
+    let raf = 0;
+    const meter = () => {                                    // the orb's voice ring follows the real voice level
+      an.getByteTimeDomainData(td);
+      let sum = 0; for (const v of td) sum += (v - 128) * (v - 128);
+      if (window.JarvisSphere) JarvisSphere.setLevel(Math.min(1, Math.sqrt(sum / td.length) / 40));
+      raf = requestAnimationFrame(meter);
+    };
+    meter();
+    src.onended = () => {
+      cancelAnimationFrame(raf);
+      if (window.JarvisSphere) JarvisSphere.setLevel(0);
+      if (curSrc === src) curSrc = null;
+      resolve();
+    };
+    const span = voicedSpan(pcm, sr);
+    src.start(0, span.start, span.dur);
+  });
+}
+const isSpeaking = () => voicePending > 0 || (window.speechSynthesis && (speechSynthesis.speaking || speechSynthesis.pending));
+function idleIfDone() { if (!isSpeaking() && !brain.busy) setState("idle"); }
+function renderVoiceHint() {
+  const el = document.getElementById("voice-hint");
+  if (!el) return;
+  el.textContent = !wantsJarvisVoice() ? "Using the phone's own voice."
+    : piper.failed ? "JARVIS's voice couldn't load (" + piper.failed.slice(0, 80) + "). Using the phone's voice for now."
+    : piper.ready ? "JARVIS's voice (Alan, same as the PC) is on this phone and works offline."
+    : piper.worker ? "Getting JARVIS's voice (63 MB, once)" + (piper.pct ? ": " + piper.pct + "%" : "…") + " The phone's voice fills in until it's here."
+    : "JARVIS's voice (63 MB) downloads with the brain.";
+  el.classList.toggle("err", !!piper.failed);
+}
+
 let voices = [];
 function loadVoices() { voices = window.speechSynthesis ? speechSynthesis.getVoices().filter((v) => /^en/i.test(v.lang)) : []; renderSettings(); }
 if (window.speechSynthesis) { loadVoices(); speechSynthesis.addEventListener?.("voiceschanged", loadVoices); }
 function pickVoice() {
-  if (cfg.voice) { const v = voices.find((x) => x.name === cfg.voice); if (v) return v; }
+  if (cfg.voice && cfg.voice !== "jarvis") { const v = voices.find((x) => x.name === cfg.voice); if (v) return v; }
   return voices.find((v) => /en-GB/i.test(v.lang) && /daniel|arthur|uk english male|male/i.test(v.name))
     || voices.find((v) => /en-GB/i.test(v.lang)) || voices[0] || null;
 }
 let levelTimer = 0;
 function speakLine(text) {
-  if (!cfg.speak || !window.speechSynthesis || !text.trim()) return;
-  const u = new SpeechSynthesisUtterance(clean(text));
+  if (!cfg.speak || !text.trim()) return;
+  const line = clean(text);
+  if (wantsJarvisVoice() && !piper.failed && (piper.ready || piper.cached)) {
+    // synthesis starts now (overlapping the sentence still playing); playback keeps the order
+    const gen = voiceGen, synth = piperSynth(line);
+    voicePending++;
+    voiceChain = voiceChain.then(async () => {
+      try {
+        if (gen !== voiceGen) return;
+        let a;
+        try { a = await synth; } catch (e) { console.warn("voice", e); if (gen === voiceGen) systemSpeak(line); return; }
+        if (gen === voiceGen) await playPcm(a.pcm, a.sr);
+      } finally { voicePending--; idleIfDone(); }
+    });
+    return;
+  }
+  if (wantsJarvisVoice() && !piper.failed) piperStart();   // first time: fetch Alan while the phone's voice stands in
+  systemSpeak(line);
+}
+function systemSpeak(line) {
+  if (!window.speechSynthesis) return;
+  const u = new SpeechSynthesisUtterance(line);
   const v = pickVoice(); if (v) { u.voice = v; u.lang = v.lang; }
   u.rate = 1.02; u.pitch = 0.95;
   u.onstart = () => setState("speaking");
@@ -273,7 +394,7 @@ function speakLine(text) {
     if (window.JarvisSphere) JarvisSphere.setLevel(0.75);
     clearTimeout(levelTimer); levelTimer = setTimeout(() => window.JarvisSphere && JarvisSphere.setLevel(0), 140);
   };
-  u.onend = u.onerror = () => { if (!speechSynthesis.speaking && !speechSynthesis.pending && !brain.busy) setState("idle"); };
+  u.onend = u.onerror = () => idleIfDone();
   speechSynthesis.speak(u);
 }
 function sentenceSpeaker() {
@@ -295,9 +416,11 @@ function say(text, isReply) {
 // iOS only lets a page speak after a tap has spoken once
 let speechUnlocked = false;
 function unlockSpeech() {
-  if (speechUnlocked || !window.speechSynthesis) return;
+  if (speechUnlocked) return;
   speechUnlocked = true;
-  const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u);
+  try { if (navigator.audioSession) navigator.audioSession.type = "playback"; } catch (_) {}   // speak even on silent mode
+  try { audio(); } catch (_) {}                          // iOS: the audio engine starts only from a tap
+  if (window.speechSynthesis) { const u = new SpeechSynthesisUtterance(" "); u.volume = 0; speechSynthesis.speak(u); }
 }
 
 /* ------------------------------------------------------------------ voice in */
@@ -495,9 +618,10 @@ function renderSettings() {
   $("#speak").checked = !!cfg.speak;
   const vs = $("#voice");
   vs.innerHTML = "";
-  vs.add(new Option("Automatic (British if available)", ""));
-  for (const v of voices) vs.add(new Option(v.name + " · " + v.lang, v.name));
-  vs.value = cfg.voice;
+  vs.add(new Option("JARVIS — same voice as the PC", "jarvis"));
+  for (const v of voices) vs.add(new Option("Phone: " + v.name + " · " + v.lang, v.name));
+  vs.value = wantsJarvisVoice() ? "jarvis" : cfg.voice;
+  renderVoiceHint();
   $("#repo").value = cfg.repo;
   $("#token").value = cfg.token;
   $("#safe").checked = safe();
@@ -537,7 +661,12 @@ $("#safe").addEventListener("change", async (e) => {
   toast(e.target.checked ? "Phone-safe mode on." : "Phone-safe mode off.");
 });
 $("#speak").addEventListener("change", (e) => { cfg.speak = e.target.checked; saveCfg(); if (!cfg.speak) speechSynthesis.cancel(); });
-$("#voice").addEventListener("change", (e) => { cfg.voice = e.target.value; saveCfg(); unlockSpeech(); speakLine("Good evening, sir."); });
+$("#voice").addEventListener("change", async (e) => {
+  cfg.voice = e.target.value; saveCfg(); unlockSpeech(); await stopEverything();
+  if (wantsJarvisVoice()) piperStart();
+  renderVoiceHint();
+  speakLine("Good evening, sir.");
+});
 $("#sync-save").addEventListener("click", () => {
   cfg.repo = $("#repo").value.trim().replace(/^https?:\/\/github\.com\//i, "").replace(/\.git$/, "").replace(/\/+$/, "");
   cfg.token = $("#token").value.trim();
@@ -576,4 +705,4 @@ sync();
   else offerDownload();
 })();
 if ("serviceWorker" in navigator && location.protocol === "https:") navigator.serviceWorker.register("sw.js").catch(() => {});
-window.__jm = { brain, sync, get facts() { return facts; }, handle, cfg };   // for tests
+window.__jm = { brain, sync, get facts() { return facts; }, handle, cfg, piper, speakLine, isSpeaking, stopEverything };   // for tests
