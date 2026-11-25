@@ -4,7 +4,7 @@
 import { CreateWebWorkerMLCEngine, CreateMLCEngine, hasModelInCache, deleteModelAllInfoInCache } from "./vendor/web-llm.js";
 import { mergeFacts, sameFacts, newUid } from "./merge.js";
 
-const VERSION = "1.0.2";
+const VERSION = "1.1.0";
 const $ = (s) => document.querySelector(s);
 const store = {
   get(k, d) { try { const v = localStorage.getItem("jm." + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
@@ -36,9 +36,28 @@ function setState(s) {
   el.className = "state " + s;
   if (window.JarvisSphere) JarvisSphere.setState(s);
 }
-if (window.JarvisSphere) {
-  JarvisSphere.setOptions({ density: 0.32 });            // a phone GPU: a third of the PC's plasma particles
-  JarvisSphere.init($("#orb"));
+// Phone orb: capped pixel density, far fewer particles, no blur. Measured at iPhone size with the CPU slowed 4x:
+// the old settings ran 30 fps, tier 0 runs 75. It watches its first seconds and steps down (remembered) if the
+// phone still can't hold 40 fps.
+const ORB_TIERS = [
+  { intensity: 0, maxDpr: 1.5, density: 0.1, detail: 0.35, web: 1 },
+  { intensity: 0, maxDpr: 1.25, density: 0.06, detail: 0.2, web: 0.6 },
+  { intensity: 0, maxDpr: 1, density: 0.05, detail: 0.12, web: 0, hud: 0.6 },
+];
+let orbTier = Math.min(ORB_TIERS.length - 1, +store.get("orbTier", 0) || 0);
+function orbFpsWatch() {
+  let n = 0, t0 = 0;
+  const f = (now) => {
+    if (document.hidden || brain.loading) { n = 0; t0 = 0; requestAnimationFrame(f); return; }   // a busy load isn't the orb's fault
+    if (!t0) t0 = now;
+    n++;
+    if (now - t0 < 3000) { requestAnimationFrame(f); return; }
+    if (n * 1000 / (now - t0) < 40 && orbTier < ORB_TIERS.length - 1) {
+      orbTier++; store.set("orbTier", orbTier); JarvisSphere.setOptions(ORB_TIERS[orbTier]);
+      n = 0; t0 = 0; requestAnimationFrame(f);
+    }
+  };
+  setTimeout(() => requestAnimationFrame(f), 1500);
 }
 
 /* ------------------------------------------------------------------ transcript */
@@ -59,11 +78,34 @@ function toast(text, ms = 3200) {
 const clean = (s) => s.replace(/<think>[\s\S]*?(<\/think>|$)/g, "").replace(/[*#_`]+/g, "").replace(/^\s*[-•]\s+/gm, "").trim();
 
 /* ------------------------------------------------------------------ the brain */
-const brain = { engine: null, model: null, loading: null, busy: false };
+const brain = { engine: null, model: null, loading: null, busy: false, where: "", gpu: "" };
+
+// iOS closes a page outright when it uses too much memory, so nothing in the page can catch it. A marker is
+// written before each heavy step and cleared after; if it's still there on the next open, that step killed the
+// page, and JARVIS switches itself to phone-safe mode (half the working memory, shorter prompts, lightest orb).
+const crashed = store.get("inflight", null);
+store.set("inflight", null);
+if (crashed) { store.set("safeMode", true); store.set("orbTier", 2); orbTier = 2; }
+const safe = () => !!store.get("safeMode", false);
+const mark = (stage) => store.set("inflight", stage ? { stage, model: cfg.model, t: Date.now() } : null);
+// leaving the app (switching away, closing it) is announced; a memory kill isn't — so leaving clears the marker
+const offscreen = () => store.set("inflight", null);
+addEventListener("pagehide", offscreen);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) offscreen();
+  else if (brain.loading) mark("loading");
+  else if (brain.busy) mark("answering");
+});
+// the working memory the brain reserves when it answers (WebLLM's default, 4096 tokens, is more than a phone needs)
+const chatOpts = () => ({ context_window_size: safe() ? 1024 : 2048 });
 
 async function gpuReady() {
   if (!navigator.gpu) return false;
-  try { return !!(await navigator.gpu.requestAdapter()); } catch (_) { return false; }
+  try {
+    const a = await navigator.gpu.requestAdapter();
+    if (a && a.info) brain.gpu = [a.info.vendor, a.info.architecture].filter(Boolean).join(" ");
+    return !!a;
+  } catch (_) { return false; }
 }
 
 function card(kind, opts = {}) {
@@ -104,17 +146,20 @@ async function loadBrain() {
       $("#brain-meta").textContent = Math.round((p.progress || 0) * 100) + "% · " + (p.text || "").replace(/\s+/g, " ").slice(0, 90);
     };
     try { await navigator.storage?.persist?.(); } catch (_) {}
+    mark("loading");
     try {
       if (brain.engine) {                                   // switching models: same engine, new weights
         brain.engine.setInitProgressCallback?.(progress);
-        await brain.engine.reload(m.id);
+        await brain.engine.reload(m.id, chatOpts());
       } else {
         try {
-          brain.engine = await CreateWebWorkerMLCEngine(new Worker(new URL("./brain-worker.js", import.meta.url), { type: "module" }), m.id, { initProgressCallback: progress });
+          brain.engine = await CreateWebWorkerMLCEngine(new Worker(new URL("./brain-worker.js", import.meta.url), { type: "module" }), m.id, { initProgressCallback: progress }, chatOpts());
+          brain.where = "worker";
         } catch (e) {
           // some browsers expose WebGPU to the page but not to workers: run it on the page instead
           console.warn("worker brain failed, using the page", e);
-          brain.engine = await CreateMLCEngine(m.id, { initProgressCallback: progress });
+          brain.engine = await CreateMLCEngine(m.id, { initProgressCallback: progress }, chatOpts());
+          brain.where = "page";
         }
       }
       brain.model = m.id;
@@ -135,6 +180,7 @@ async function loadBrain() {
       });
       throw e;
     } finally {
+      mark(null);
       brain.loading = null;
       renderSettings();
     }
@@ -145,7 +191,7 @@ async function loadBrain() {
 function systemPrompt() {
   const name = (profile && profile.name) || "";
   const now = new Date().toLocaleString([], { weekday: "long", month: "long", day: "numeric", year: "numeric", hour: "numeric", minute: "2-digit" });
-  const mem = facts.slice(-40).map((f) => "- " + f.text).join("\n");
+  const mem = facts.slice(safe() ? -12 : -25).map((f) => "- " + f.text).join("\n");   // must fit the working memory
   return [
     "You are J.A.R.V.I.S., the personal AI assistant" + (name ? " of " + name : "") + ", running entirely on their phone.",
     "Speak like a calm, dry-witted English butler: formal, concise, never chirpy, never exclamatory. Address them as \"sir\".",
@@ -171,12 +217,13 @@ async function think(text) {
   try {
     // chat templates (Gemma's especially) need user/assistant to alternate, starting with the user
     const past = [];
-    for (const m of history.slice(-10)) { if (past.length && past[past.length - 1].role === m.role) past.pop(); past.push(m); }
+    for (const m of history.slice(safe() ? -4 : -8)) { if (past.length && past[past.length - 1].role === m.role) past.pop(); past.push(m); }
     while (past.length && past[0].role !== "user") past.shift();
     if (past.length && past[past.length - 1].role === "user") past.pop();
     const messages = [{ role: "system", content: systemPrompt() }, ...past, { role: "user", content: text }];
-    const req = { messages, stream: true, temperature: 0.6, max_tokens: 320 };
+    const req = { messages, stream: true, temperature: 0.6, max_tokens: safe() ? 160 : 260 };
     if (/^Qwen3/.test(brain.model)) req.extra_body = { enable_thinking: false };   // Qwen3 thinks out loud by default
+    mark("answering");
     const chunks = await brain.engine.chat.completions.create(req);
     for await (const ch of chunks) {
       const d = (ch.choices[0] && ch.choices[0].delta && ch.choices[0].delta.content) || "";
@@ -190,6 +237,7 @@ async function think(text) {
     console.warn(e);
     if (!out) el.textContent = "My apologies, sir — the brain stumbled. " + String(e && e.message || e).slice(0, 80);
   } finally {
+    mark(null);
     brain.busy = false;
     el.classList.remove("live");
     speaker.end();
@@ -287,8 +335,23 @@ $("#mic").addEventListener("click", async () => {
 /* ------------------------------------------------------------------ memory commands (handled here, not by the model) */
 const RX_REMEMBER = /^(?:hey\s+)?(?:jarvis[,.!]?\s+)?(?:please\s+)?remember(?:\s+that)?[:,]?\s+(.{3,}?)[.!]?$/i;
 const RX_FORGET = /^(?:hey\s+)?(?:jarvis[,.!]?\s+)?(?:please\s+)?forget(?:\s+about)?(?:\s+that)?[:,]?\s+(.{2,}?)[.!]?$/i;
+// Facts are stored about the principal in the third person, like the PC's ("Likes Minecraft", "Sister is Mia"):
+// a small model reads "I like Minecraft" in its memory list as something about itself.
+function thirdPerson(t) {
+  const IRREG = { am: "Is", "'m": "Is", have: "Has", do: "Does", go: "Goes", was: "Was", can: "Can", will: "Will", "'ll": "Will", "'ve": "Has" };
+  t = t.replace(/^my\s+/i, "");
+  let m = t.match(/^i\s*('m|'ll|'ve)\s+(.*)$/i) || t.match(/^i\s+(am|have|do|go|was|can|will)\s+(.*)$/i);
+  if (m) return IRREG[m[1].toLowerCase()] + " " + m[2];
+  m = t.match(/^i\s+([a-z]+)\s+(.*)$/i);
+  if (m) {
+    const v = m[1].toLowerCase();
+    const verb = /(s|sh|ch|x|z|o)$/.test(v) ? v + "es" : /[^aeiou]y$/.test(v) ? v.slice(0, -1) + "ies" : v + "s";
+    return verb.charAt(0).toUpperCase() + verb.slice(1) + " " + m[2];
+  }
+  return t;
+}
 function addFact(text) {
-  text = text.replace(/\s+/g, " ").trim().replace(/^my\s+/i, "").slice(0, 240);   // "my sister is Mia" -> "Sister is Mia", like the PC's facts
+  text = thirdPerson(text.replace(/\s+/g, " ").trim()).slice(0, 240);
   text = text.charAt(0).toUpperCase() + text.slice(1);
   const low = text.toLowerCase();
   facts = facts.filter((f) => f.text.toLowerCase() !== low);
@@ -437,7 +500,9 @@ function renderSettings() {
   vs.value = cfg.voice;
   $("#repo").value = cfg.repo;
   $("#token").value = cfg.token;
-  $("#about").textContent = "JARVIS mobile " + VERSION + " · the brain runs on this phone; conversations never leave it.";
+  $("#safe").checked = safe();
+  $("#about").textContent = "JARVIS mobile " + VERSION + " · the brain runs on this phone; conversations never leave it." +
+    (brain.where ? " Brain on the " + brain.where + (brain.gpu ? ", GPU " + brain.gpu : "") + "." : "") + " Orb level " + (orbTier + 1) + "/3.";
   renderMemory();
 }
 function renderMemory() {
@@ -466,6 +531,11 @@ $("#model").addEventListener("change", async (e) => {
   if (await hasModelInCache(cfg.model).catch(() => false)) loadBrain().catch(() => {});
   else { $("#sheet").hidden = true; offerDownload(); }
 });
+$("#safe").addEventListener("change", async (e) => {
+  store.set("safeMode", e.target.checked);
+  if (brain.engine && !brain.busy) { try { await brain.engine.reload(brain.model, chatOpts()); } catch (_) {} }   // new working-memory size
+  toast(e.target.checked ? "Phone-safe mode on." : "Phone-safe mode off.");
+});
 $("#speak").addEventListener("change", (e) => { cfg.speak = e.target.checked; saveCfg(); if (!cfg.speak) speechSynthesis.cancel(); });
 $("#voice").addEventListener("change", (e) => { cfg.voice = e.target.value; saveCfg(); unlockSpeech(); speakLine("Good evening, sir."); });
 $("#sync-save").addEventListener("click", () => {
@@ -486,7 +556,14 @@ $("#chat-clear").addEventListener("click", () => {
 });
 
 /* ------------------------------------------------------------------ start */
+if (window.JarvisSphere) {
+  JarvisSphere.setOptions(ORB_TIERS[orbTier]);
+  JarvisSphere.init($("#orb"));
+  orbFpsWatch();
+}
 for (const m of history.slice(-12)) addMsg(m.role === "user" ? "user" : "jarvis", m.content);
+if (crashed) addMsg("note", "JARVIS CLOSED WHILE " + String(crashed.stage || "working").toUpperCase() + " LAST TIME — THE PHONE RAN OUT OF MEMORY. " +
+  "PHONE-SAFE MODE IS NOW ON: SMALLER WORKING MEMORY, SHORTER ANSWERS, LIGHTEST ORB.");
 setState("idle");
 renderMemory();
 sync();

@@ -36,6 +36,7 @@
 
   // ---- options (module vars, safe before init) ----
   var optDensity = 0.67, optIntensity = 1, optMotion = 1, optWeb = 1, optSpec = 1, optHud = 1, optPulses = 1;
+  var optMaxDpr = 4, nNuc = N_NUC, nDisk = N_DISK;     // phones: cap the pixel density, thin the nucleus + disk
   var np = Math.round(NP_MAX * optDensity);
 
   // ---- particles ----
@@ -113,7 +114,7 @@
 
   function resize() {
     if (!canvas) { return; }
-    dpr = window.devicePixelRatio || 1;
+    dpr = Math.min(optMaxDpr, window.devicePixelRatio || 1);
     if (!(dpr > 0) || !isFinite(dpr)) { dpr = 1; }
     var dw = Math.round(canvas.clientWidth * dpr), dh = Math.round(canvas.clientHeight * dpr);
     if (!(dw >= 0)) { dw = 0; }
@@ -194,7 +195,7 @@
   }
 
   function renderFrame(nowMs) {
-    if ((window.devicePixelRatio || 1) !== dpr) { resize(); }
+    if (Math.min(optMaxDpr, window.devicePixelRatio || 1) !== dpr) { resize(); }
     var dt = (nowMs - lastNow) / 1000;
     lastNow = nowMs;
     if (!(dt > 0)) { dt = 0.016; }
@@ -263,7 +264,7 @@
       paths = [];
       for (k = 0; k < 8; k++) { paths.push([new Path2D(), new Path2D()]); }   // [alpha bucket][back, front]
       var dsp = (1 + 1.5 * after(ignAt, 2) + bt + lv) * mdt;
-      for (k = 0; k < N_DISK; k++) {
+      for (k = 0; k < nDisk; k++) {
         dA[k] += 1.7 / Math.pow(dR[k], 1.5) * dsp;
         var rr = dR[k] * (0.6 + 0.4 * diskIn) * (1 + 0.04 * bt);
         rot(Math.cos(dA[k]) * rr, dY[k], Math.sin(dA[k]) * rr, DISK_AX, spin * 0.15, DISK_AZ);
@@ -321,7 +322,7 @@
       }
       // nucleus, turning the other way
       var na = clamp((timeSec - ignAt) / 0.4, 0, 1);
-      for (k = 0; k < N_NUC; k++) {
+      for (k = 0; k < nNuc; k++) {
         nLon[k] -= 1.6 * fl * mdt; nLat[k] += 0.6 * Math.sin(nLon[k] * 3 + timeSec) * fl * mdt;
         var c0 = Math.cos(nLat[k]), r0 = nRR[k] * swell * (1 + 0.15 * bt);
         rot(c0 * Math.cos(nLon[k]) * r0, Math.sin(nLat[k]) * r0, c0 * Math.sin(nLon[k]) * r0, -TILT, -spin * 1.3, 0);
@@ -621,6 +622,8 @@
       if (opts.intensity !== undefined && (v = num(opts.intensity, 0, 2)) !== null) { optIntensity = v; }
       if (opts.motion !== undefined && (v = num(opts.motion, 0, 2)) !== null) { optMotion = v; }
       if (opts.web !== undefined && (v = num(opts.web, 0, 2)) !== null) { optWeb = v; }
+      if (opts.maxDpr !== undefined && (v = num(opts.maxDpr, 0.5, 4)) !== null) { optMaxDpr = v; resize(); }
+      if (opts.detail !== undefined && (v = num(opts.detail, 0.05, 1)) !== null) { nNuc = Math.round(N_NUC * v); nDisk = Math.round(N_DISK * v); }
       if (opts.spec !== undefined && (v = num(opts.spec, 0, 2)) !== null) { optSpec = v; }
       if (opts.hud !== undefined && (v = num(opts.hud, 0, 2)) !== null) { optHud = v; }
       if (opts.pulses !== undefined) { optPulses = opts.pulses ? 1 : 0; }
