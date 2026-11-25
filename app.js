@@ -4,7 +4,7 @@
 import { CreateWebWorkerMLCEngine, CreateMLCEngine, hasModelInCache, deleteModelAllInfoInCache } from "./vendor/web-llm.js";
 import { mergeFacts, sameFacts, newUid } from "./merge.js";
 
-const VERSION = "1.0.1";
+const VERSION = "1.0.2";
 const $ = (s) => document.querySelector(s);
 const store = {
   get(k, d) { try { const v = localStorage.getItem("jm." + k); return v == null ? d : JSON.parse(v); } catch (_) { return d; } },
