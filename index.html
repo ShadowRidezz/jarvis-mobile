@@ -71,6 +71,9 @@
     <div class="sec">MEMORY SYNC</div>
     <p class="hint">Your memory lives in a private GitHub repo, shared with JARVIS on your PC. Paste a fine-grained GitHub token with
       <b>Contents: Read and write</b> on that repo only. It stays on this phone.</p>
+    <a class="btn ghost linkbtn" target="_blank" rel="noopener"
+       href="https://github.com/settings/personal-access-tokens/new?name=JARVIS%20phone&amp;description=JARVIS%20mobile%20memory%20sync&amp;expires_in=365&amp;contents=write">MAKE THE TOKEN ON GITHUB</a>
+    <p class="hint">On that page pick <b>Only select repositories → jarvis-data</b>, tap Generate, copy the token and paste it below.</p>
     <label class="row col"><span>Repo</span><input id="repo" type="text" spellcheck="false" autocapitalize="off" placeholder="owner/jarvis-data"></label>
     <label class="row col"><span>Token</span><input id="token" type="password" spellcheck="false" autocapitalize="off" placeholder="github_pat_…"></label>
     <button id="sync-save" class="btn" type="button">SAVE &amp; SYNC</button>

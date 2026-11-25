@@ -78,6 +78,7 @@ button, input, select { font: inherit; color: inherit; }
 .btn:active { background: rgba(53, 224, 255, 0.22); }
 .btn.ghost { background: none; border-color: var(--line); color: var(--cyan-dim); }
 .btn:disabled { opacity: 0.45; }
+.linkbtn { text-align: center; text-decoration: none; }
 
 .log { flex: 1; min-height: 0; overflow-y: auto; padding: 4px 16px 10px; display: flex; flex-direction: column; gap: 10px;
   -webkit-mask: linear-gradient(transparent, black 24px); mask: linear-gradient(transparent, black 24px); }
